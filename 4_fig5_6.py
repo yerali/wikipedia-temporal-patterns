@@ -1,191 +1,284 @@
 """
-Weekly activity profiles and temporal clustering (Figs. 5 and 6).
+Robustness of the language pairs to the dimensionality reduction method
+(Supplementary Information, Fig. S1).
 
-Figure 5 uses the number of edits and Figure 6 the number of editors.
-Each figure has four panels:
-    (a) absolute weekly activity of each edition;
-    (b) the same profiles, each edition rescaled to the interval [0, 1];
-    (c) dendrogram of the timing-only representation;
-    (d) dendrogram of the composition-and-timing representation.
+Each of the two temporal representations (timing only; composition and
+timing) is reduced with four methods before Ward clustering (PCA,
+autoencoder, t-SNE and UMAP) and compared with the unreduced clustering.
+Repeating this for edits and editors gives 4 conditions x 5 treatments =
+20 combinations.
 
-The two representations are built from the 11 editions x 13 categories
-x 168 hours tensor:
-    (c) timing only: each (edition, category) block is divided by its sum
-        over the 168 hours, which removes the size of the edition and the
-        weight of each category and keeps only the shape of the weekly
-        cycle.
-    (d) composition and timing: each edition is divided by its total
-        activity, which removes the size of the edition but keeps the
-        relative weight of the categories.
+In every clustering all 55 pairs of editions are evaluated. A pair "forms"
+when the two editions join each other directly in a merge, before either
+of them has joined any other edition. The figure shows, for each pair that
+forms at least once, whether it forms in each combination and the height
+at which the two editions first meet, relative to the root.
 
 Input:
-    The tensor cache tensor_cat_<metric>.csv produced by
-    dendrogramas_dos_normalizaciones.py, which must be in the same folder
-    as this script. With --recompute the tensor is rebuilt from the raw
-    data files.
+    The tensor cache produced by dendrogramas_dos_normalizaciones.py.
+    That module and dimensionality_reduction.py must be in the same folder
+    as this script.
 
 Output:
-    figuras/fig5_edits.pdf
-    figuras/fig6_editors.pdf
+    figuras/figSI_test_pares.pdf
+    resultados_figSI_pares.txt  (counts and merge heights)
 
 Usage:
-    python 4_fig5_6.py
-    python 4_fig5_6.py --recompute
+    python 6_figSI.py
 """
 
-import sys
+import random
+from itertools import combinations
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.cluster.hierarchy import dendrogram
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
 
-# The tensor and the two normalisations are imported from the module used
-# in the rest of the analysis, so that all figures rely on the same
-# definitions.
 try:
     from dendrogramas_dos_normalizaciones import (
-        LANGUAGES, OUT_DIR, load_tensor, block_mask, normalise, ward,
+        LANGUAGES, DATA_DIR, OUT_DIR, load_tensor, block_mask, normalise, ward,
+    )
+    from dimensionality_reduction import (
+        REDUCTIONS, METHOD_ORDER, global_scale, HAS_TF, HAS_UMAP,
     )
 except ImportError as e:
     raise SystemExit(
-        "dendrogramas_dos_normalizaciones.py not found in this folder.\n"
-        f"Details: {e}")
+        "dendrogramas_dos_normalizaciones.py and dimensionality_reduction.py "
+        f"must be in this folder.\nDetails: {e}")
 
 
 # =================================================================
-# Configuration
+# Parameters
 # =================================================================
 
-HOURS_PER_WEEK = 168
-DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+# Global seed for Python, NumPy and TensorFlow. Each reduction method also
+# fixes its own seed (RANDOM_STATE in dimensionality_reduction.py); this
+# additionally fixes the global state and makes TensorFlow operations
+# deterministic. The results reported in the SI were obtained with it.
+SEED = 0
 
-# One colour per edition, the same in both figures.
-COLORS = {lang: c for lang, c in zip(
-    LANGUAGES, plt.get_cmap("tab20")(np.linspace(0, 1, 20))[:len(LANGUAGES)])}
-
-# Normalisation modes of the imported module and the title of their panel.
-DENDROGRAM_TITLES = {
-    "timing": "(c) Timing only\n(each category normalised to unit sum)",
-    "composition": "(d) Composition + timing\n(each language normalised by total activity)",
+# The four conditions: (metric, normalisation).
+CONDITIONS = [(m, n) for m in ("edits", "editors")
+              for n in ("timing", "composition")]
+CONDITION_LABELS = {
+    ("edits", "timing"): "edits — timing only",
+    ("edits", "composition"): "edits — composition + timing",
+    ("editors", "timing"): "editors — timing only",
+    ("editors", "composition"): "editors — composition + timing",
 }
+METHOD_LABELS = {"none": "none", "pca": "PCA(5)", "autoencoder": "autoencoder",
+                 "tsne": "t-SNE", "umap": "UMAP"}
+
+# Pairs discussed in the main text; their labels are shown in bold.
+MANUSCRIPT_PAIRS = [("ru", "zh"), ("es", "pt"), ("vi", "ar"), ("de", "fr")]
+
+# Cell colours: light grey when the pair does not form, blue when it does.
+BINARY_COLORS = ListedColormap(["#f2f2f2", "#2c7fb8"])
+
+ALL_PAIRS = list(combinations(LANGUAGES, 2))
 
 
 # =================================================================
-# Weekly profiles
+# Measures on a dendrogram
 # =================================================================
 
-def aggregate_profile(T):
+def merge_height(Z, a, b):
     """
-    Sum the 13 categories of the tensor.
-
-    Args:
-        T: array of shape (11, 13, 168).
+    Find where two editions first meet in a dendrogram.
 
     Returns:
-        Array of shape (11, 168) with the weekly profile of each edition.
+        Tuple (relative height, direct): the height of the merge that first
+        joins a and b, divided by the height of the root; and whether that
+        merge joins a and b directly, before either joined another edition.
     """
-    return T.sum(axis=1)
+    n = len(LANGUAGES)
+    ia, ib = LANGUAGES.index(a), LANGUAGES.index(b)
+    members = {i: {i} for i in range(n)}
+    root = Z[-1, 2]
+    for step, (x, y, dist, _) in enumerate(Z):
+        x, y = int(x), int(y)
+        merged = members[x] | members[y]
+        members[n + step] = merged
+        if ia in merged and ib in merged:
+            direct = (members[x] == {ia} and members[y] == {ib}) or \
+                     (members[x] == {ib} and members[y] == {ia})
+            return (dist / root if root > 0 else np.nan), direct
+    return np.nan, False
 
 
-def minmax_rescale(P):
-    """
-    Rescale each edition's profile to the interval [0, 1], so that the
-    shape of the weekly cycle can be compared across editions of very
-    different size.
-    """
-    lo = P.min(axis=1, keepdims=True)
-    hi = P.max(axis=1, keepdims=True)
-    span = np.where(hi - lo == 0, 1.0, hi - lo)
-    return (P - lo) / span
+def measure_pairs(Z):
+    """Relative height and direct-pair flag for all 55 pairs."""
+    return {pair: merge_height(Z, *pair) for pair in ALL_PAIRS}
 
 
 # =================================================================
-# Plotting
+# Analysis
 # =================================================================
 
-def format_week_axis(ax):
-    """Label the x axis with the hour of the week, one tick every 6 hours."""
-    ax.set_xticks(np.arange(0, HOURS_PER_WEEK, 6))
-    ax.set_xticklabels([f"{d} {h:02d}h" for d in DAY_NAMES
-                        for h in range(0, 24, 6)], rotation=90, fontsize=6)
-    ax.set_xlabel("Hour of the week", fontsize=9)
-    ax.grid(True, alpha=0.3)
+def analyse():
+    """Cluster every condition with every method."""
+    results = {}
+    tensors = {m: load_tensor(m) for m in ("edits", "editors")}
+    for cond in CONDITIONS:
+        metric, mode = cond
+        T = tensors[metric]
+        mask = block_mask(T)
+        X = global_scale(normalise(T, mode, mask))
+
+        # Ward clustering after each reduction.
+        Zs, skipped = {}, []
+        for name in METHOD_ORDER:
+            Y = REDUCTIONS[name](X)
+            if Y is None:
+                skipped.append(name)
+                continue
+            Zs[name] = ward(Y)
+        print(f"[{CONDITION_LABELS[cond]}] methods: {list(Zs)}")
+
+        measures = {m: measure_pairs(Z) for m, Z in Zs.items()}
+        results[cond] = dict(measures=measures, skipped=skipped)
+    return results
 
 
-def plot_profiles(ax, P, ylabel, title, legend=False):
-    """Draw one weekly profile per edition."""
-    for i, lang in enumerate(LANGUAGES):
-        ax.plot(np.arange(HOURS_PER_WEEK), P[i], color=COLORS[lang],
-                lw=1.0, label=lang)
-    format_week_axis(ax)
-    ax.set_ylabel(ylabel, fontsize=9)
-    ax.set_title(title, fontsize=10, loc="left")
-    if legend:
-        ax.legend(title="Languages", fontsize=7, title_fontsize=7,
-                  ncol=2, loc="upper right", framealpha=0.85)
-
-
-def plot_dendrogram(ax, Z, title):
-    """Draw a dendrogram with the height of each merge written on it."""
-    d = dendrogram(Z, labels=LANGUAGES, ax=ax, distance_sort="descending",
-                   leaf_rotation=90, leaf_font_size=9, show_leaf_counts=True)
-    for ic, dc, col in zip(d["icoord"], d["dcoord"], d["color_list"]):
-        x = 0.5 * sum(ic[1:3])
-        y = dc[1]
-        if y > 0:
-            ax.plot(x, y, "o", ms=3, c=col)
-            ax.annotate(f"{y:.3g}", (x, y), xytext=(0, -8),
-                        textcoords="offset points", va="top", ha="center",
-                        fontsize=6)
-    ax.set_title(title, fontsize=10, loc="left")
-    ax.set_ylabel("Distance", fontsize=9)
-    ax.grid(False)
-
-
-def make_figure(metric, number, recompute=False):
+def pairs_to_show(results):
     """
-    Build and save one figure.
-
-    Args:
-        metric: 'edits' or 'editors'.
-        number: figure number, used in the output file name.
-        recompute: rebuild the tensor from the raw data instead of the cache.
+    Pairs that form at least once, sorted by the number of combinations in
+    which they form. Returns the sorted list and the count of every pair.
     """
-    # Load the tensor and mark the (edition, category) blocks with activity.
-    T = load_tensor(metric, recompute=recompute)
-    mask = block_mask(T)
+    count = {pair: 0 for pair in ALL_PAIRS}
+    for r in results.values():
+        for m in r["measures"].values():
+            for pair, (_h, direct) in m.items():
+                count[pair] += int(bool(direct))
+    shown = [p for p in ALL_PAIRS if count[p] > 0]
+    return sorted(shown, key=lambda p: -count[p]), count
 
-    # Weekly profiles for panels (a) and (b).
-    P = aggregate_profile(T)
-    P_rescaled = minmax_rescale(P)
 
-    # Ward clustering of the two normalised representations.
-    Z = {mode: ward(normalise(T, mode, mask)) for mode in DENDROGRAM_TITLES}
+# =================================================================
+# Figure
+# =================================================================
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    plot_profiles(axes[0][0], P, f"Number of {metric}",
-                  "(a) Absolute activity", legend=True)
-    plot_profiles(axes[0][1], P_rescaled, f"Normalised number of {metric}",
-                  "(b) Normalised activity")
-    plot_dendrogram(axes[1][0], Z["timing"], DENDROGRAM_TITLES["timing"])
-    plot_dendrogram(axes[1][1], Z["composition"], DENDROGRAM_TITLES["composition"])
+def plot_figure(results, pairs):
+    """Draw one panel per condition, with one column per method."""
+    fig, axes = plt.subplots(2, 2, figsize=(13, 3 + 0.40 * len(pairs) * 2))
+    labels = [f"{a}-{b}" for a, b in pairs]
+    for k, (ax, cond) in enumerate(zip(axes.flat, CONDITIONS)):
+        r = results[cond]
+        methods = list(r["measures"])
 
-    fig.tight_layout()
+        # H: relative merge heights; B: 1 where the pair forms.
+        H = np.full((len(pairs), len(methods)), np.nan)
+        B = np.zeros_like(H)
+        for j, m in enumerate(methods):
+            for i, pair in enumerate(pairs):
+                h, direct = r["measures"][m][pair]
+                H[i, j], B[i, j] = h, 1.0 if direct else 0.0
+
+        # Cells drawn as vector rectangles (pcolormesh rather than imshow,
+        # which some PDF viewers distort).
+        ax.pcolormesh(np.arange(len(methods) + 1) - 0.5,
+                      np.arange(len(pairs) + 1) - 0.5,
+                      B, cmap=BINARY_COLORS, vmin=0, vmax=1)
+        ax.set_xlim(-0.5, len(methods) - 0.5)
+        ax.set_ylim(len(pairs) - 0.5, -0.5)      # first pair at the top
+        ax.set_xticks(range(len(methods)))
+        ax.set_xticklabels([METHOD_LABELS.get(m, m) for m in methods],
+                           rotation=45, ha="right", fontsize=8)
+        ax.set_yticks(range(len(pairs)))
+        ax.set_yticklabels(labels, fontsize=8)
+
+        # White lines between cells.
+        ax.set_xticks(np.arange(-0.5, len(methods), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(pairs), 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=1.2)
+        ax.tick_params(which="minor", length=0)
+
+        # Relative height written in each cell; manuscript pairs in bold.
+        for i in range(len(pairs)):
+            for j in range(len(methods)):
+                if np.isnan(H[i, j]):
+                    continue
+                ax.text(j, i, f"{H[i, j]:.2f}", ha="center", va="center",
+                        fontsize=7, color="white" if B[i, j] else "#555555")
+            if pairs[i] in MANUSCRIPT_PAIRS or pairs[i][::-1] in MANUSCRIPT_PAIRS:
+                ax.get_yticklabels()[i].set_fontweight("bold")
+        ax.set_title(f"({chr(97 + k)}) {CONDITION_LABELS[cond]}", fontsize=9)
+
+    fig.legend(handles=[Patch(facecolor="#2c7fb8", label="pair"),
+                        Patch(facecolor="#f2f2f2", edgecolor="#cccccc",
+                              label="no pair")],
+               loc="lower center", ncol=2, frameon=False, fontsize=9)
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
     OUT_DIR.mkdir(exist_ok=True)
-    out = OUT_DIR / f"fig{number}_{metric}.pdf"
+    out = OUT_DIR / "figSI_test_pares.pdf"
     fig.savefig(out)
     plt.close(fig)
     print(f"Saved: {out}")
 
 
 # =================================================================
+# Report
+# =================================================================
+
+def write_report(results, pairs, count):
+    """Save and print the counts and the merge heights."""
+    total = sum(len(r["measures"]) for r in results.values())
+    lines = ["SUPPLEMENTARY FIGURE - robustness of the pairs", ""]
+
+    # Number of combinations in which each pair forms.
+    lines.append(f"COUNTS over {total} combinations (method x condition)")
+    for p in pairs:
+        mark = "  <-- main text" if (p in MANUSCRIPT_PAIRS or
+                                     p[::-1] in MANUSCRIPT_PAIRS) else ""
+        lines.append(f"  {p[0]}-{p[1]:<4} forms {count[p]:>2}/{total}{mark}")
+    lines.append("")
+
+    # Relative merge height per condition and method (* = pair forms).
+    for cond in CONDITIONS:
+        r = results[cond]
+        lines.append(f"=== {CONDITION_LABELS[cond]} ===")
+        if r["skipped"]:
+            lines.append(f"  (skipped: {r['skipped']})")
+        lines.append("  " + "pair".ljust(9) +
+                     "".join(m[:9].ljust(11) for m in r["measures"]))
+        for pair in pairs:
+            row = "  " + f"{pair[0]}-{pair[1]}".ljust(9)
+            for m in r["measures"]:
+                h, direct = r["measures"][m][pair]
+                row += (f"{h:.2f}{'*' if direct else ' '}").ljust(11)
+            lines.append(row)
+        lines.append("")
+
+    text = "\n".join(lines)
+    (DATA_DIR / "resultados_figSI_pares.txt").write_text(text, encoding="utf-8")
+    print("\n" + text)
+
+
+# =================================================================
 # Main
 # =================================================================
 
+def set_seeds(seed=SEED):
+    """Fix the Python, NumPy and TensorFlow seeds (see SEED above)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    if HAS_TF:
+        import tensorflow as tf
+        tf.keras.utils.set_random_seed(seed)
+        tf.config.experimental.enable_op_determinism()
+
+
 def main():
-    recompute = "--recompute" in sys.argv[1:]
-    make_figure("edits", 5, recompute=recompute)
-    make_figure("editors", 6, recompute=recompute)
+    set_seeds()
+    if not HAS_TF:
+        print("WARNING: tensorflow not installed -> autoencoder skipped")
+    if not HAS_UMAP:
+        print("WARNING: umap-learn not installed -> UMAP skipped")
+    results = analyse()
+    pairs, count = pairs_to_show(results)
+    write_report(results, pairs, count)
+    plot_figure(results, pairs)
 
 
 if __name__ == "__main__":

@@ -14,14 +14,6 @@ of them has joined any other edition. The figure shows, for each pair that
 forms at least once, whether it forms in each combination and the height
 at which the two editions first meet, relative to the root.
 
-Null model: the language labels are permuted independently within each
-category, so that a null "edition" takes its profile in one category from
-one language and in another category from another. This keeps the real
-profiles and the overall geometry and destroys only the coherence of each
-edition across categories. For computational cost it is applied to the
-unreduced and PCA clusterings only. Its calibration is checked with the
-fraction of editions in the largest cluster at k = 3.
-
 Input:
     The tensor cache produced by dendrogramas_dos_normalizaciones.py.
     That module and dimensionality_reduction.py must be in the same folder
@@ -29,21 +21,19 @@ Input:
 
 Output:
     figuras/figSI_test_pares.pdf
-    resultados_figSI_pares.txt  (calibration, counts and merge heights)
+    resultados_figSI_pares.txt  (counts and merge heights)
 
 Usage:
     python 6_figSI.py
 """
 
 import random
-from collections import Counter
 from itertools import combinations
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
-from scipy.cluster.hierarchy import fcluster
 
 try:
     from dendrogramas_dos_normalizaciones import (
@@ -61,9 +51,6 @@ except ImportError as e:
 # =================================================================
 # Parameters
 # =================================================================
-
-NULL_REPLICAS = 200
-NULL_METHODS = ["none", "pca"]       # methods on which the null is computed
 
 # Global seed for Python, NumPy and TensorFlow. Each reduction method also
 # fixes its own seed (RANDOM_STATE in dimensionality_reduction.py); this
@@ -96,13 +83,6 @@ ALL_PAIRS = list(combinations(LANGUAGES, 2))
 # Measures on a dendrogram
 # =================================================================
 
-def degeneracy(Z, k=3):
-    """Fraction of editions in the largest cluster when the tree is cut
-    into k clusters (1/k = balanced, 1 = all together)."""
-    labels = fcluster(Z, k, criterion="maxclust")
-    return max(Counter(labels).values()) / len(labels)
-
-
 def merge_height(Z, a, b):
     """
     Find where two editions first meet in a dendrogram.
@@ -133,52 +113,11 @@ def measure_pairs(Z):
 
 
 # =================================================================
-# Null model
-# =================================================================
-
-def permute_labels(T, rng):
-    """Permute the language labels independently within each category."""
-    P = np.empty_like(T)
-    for c in range(T.shape[1]):
-        P[:, c, :] = T[rng.permutation(T.shape[0]), c, :]
-    return P
-
-
-def null_model(T, mask, mode, methods, n_rep=NULL_REPLICAS, seed=0):
-    """
-    Run the null model for one condition.
-
-    Returns:
-        Tuple (freq, degeneracies): for every pair, the fraction of
-        replicas in which it forms (averaged over methods); and the mean
-        degeneracy of each method.
-    """
-    rng = np.random.default_rng(seed)
-    counts = {(m, pair): 0 for m in methods for pair in ALL_PAIRS}
-    degen = {m: [] for m in methods}
-    for _ in range(n_rep):
-        X = global_scale(normalise(permute_labels(T, rng), mode, mask))
-        for m in methods:
-            Y = REDUCTIONS[m](X)
-            if Y is None:
-                continue
-            Z = ward(Y)
-            degen[m].append(degeneracy(Z, 3))
-            for pair, (_h, direct) in measure_pairs(Z).items():
-                if direct:
-                    counts[(m, pair)] += 1
-    freq = {pair: np.mean([counts[(m, pair)] / n_rep for m in methods])
-            for pair in ALL_PAIRS}
-    mean_degen = {m: (np.mean(v) if v else np.nan) for m, v in degen.items()}
-    return freq, mean_degen
-
-
-# =================================================================
 # Analysis
 # =================================================================
 
 def analyse():
-    """Cluster every condition with every method and run the null model."""
+    """Cluster every condition with every method."""
     results = {}
     tensors = {m: load_tensor(m) for m in ("edits", "editors")}
     for cond in CONDITIONS:
@@ -198,17 +137,7 @@ def analyse():
         print(f"[{CONDITION_LABELS[cond]}] methods: {list(Zs)}")
 
         measures = {m: measure_pairs(Z) for m, Z in Zs.items()}
-        # Observed degeneracy, on the same methods as the null model.
-        degen_obs = {m: degeneracy(Z, 3) for m, Z in Zs.items()
-                     if m in NULL_METHODS}
-
-        methods = [m for m in NULL_METHODS if m in Zs]
-        print(f"    null model ({NULL_REPLICAS} label permutations)...")
-        null_freq, degen_null = null_model(T, mask, mode, methods)
-
-        results[cond] = dict(measures=measures, skipped=skipped,
-                             degen_obs=degen_obs, null_freq=null_freq,
-                             degen_null=degen_null)
+        results[cond] = dict(measures=measures, skipped=skipped)
     return results
 
 
@@ -293,26 +222,16 @@ def plot_figure(results, pairs):
 # =================================================================
 
 def write_report(results, pairs, count):
-    """Save and print the calibration, the counts and the merge heights."""
+    """Save and print the counts and the merge heights."""
     total = sum(len(r["measures"]) for r in results.values())
-    lines = ["SUPPLEMENTARY FIGURE - robustness of the pairs", "",
-             "NULL MODEL CALIBRATION (degeneracy at k = 3)"]
-    for cond in CONDITIONS:
-        r = results[cond]
-        lines.append(f"  {CONDITION_LABELS[cond]}: observed "
-                     f"{np.mean(list(r['degen_obs'].values())):.2f} | "
-                     f"null {np.nanmean(list(r['degen_null'].values())):.2f}")
-    lines.append("")
+    lines = ["SUPPLEMENTARY FIGURE - robustness of the pairs", ""]
 
-    # Number of combinations in which each pair forms, and the number
-    # expected under the null model.
+    # Number of combinations in which each pair forms.
     lines.append(f"COUNTS over {total} combinations (method x condition)")
     for p in pairs:
-        expected = np.mean([results[c]["null_freq"][p] for c in CONDITIONS]) * total
         mark = "  <-- main text" if (p in MANUSCRIPT_PAIRS or
                                      p[::-1] in MANUSCRIPT_PAIRS) else ""
-        lines.append(f"  {p[0]}-{p[1]:<4} forms {count[p]:>2}/{total}  "
-                     f"| expected under the null {expected:.1f}{mark}")
+        lines.append(f"  {p[0]}-{p[1]:<4} forms {count[p]:>2}/{total}{mark}")
     lines.append("")
 
     # Relative merge height per condition and method (* = pair forms).
